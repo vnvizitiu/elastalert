@@ -8,7 +8,7 @@
 
 ElastAlert is a simple framework for alerting on anomalies, spikes, or other patterns of interest from data in Elasticsearch.
 
-ElastAlert currently works with Elasticsearch 1.X and 2.X.
+ElastAlert works with all versions of Elasticsearch.
 
 At Yelp, we use Elasticsearch, Logstash and Kibana for managing our ever increasing amount of data and logs.
 Kibana is great for visualizing and querying data, but we quickly realized that it needed a companion tool for alerting
@@ -44,11 +44,13 @@ Currently, we have support built in for the following alert types:
 - OpsGenie
 - Commands
 - HipChat
+- MS Teams
 - Slack
 - Telegram
 - AWS SNS
 - VictorOps
 - PagerDuty
+- Exotel
 - Twilio
 - Gitter
 
@@ -84,9 +86,23 @@ Eg: ``--rule this_rule.yaml``
 
 ``--config`` allows you to specify the location of the configuration. By default, it is will look for config.yaml in the current directory.
 
+## Third Party Tools And Extras
+### Bitsensor Kibana plugin
+[Configure and test rules via a Kibana plugin](https://bitsensor.io/blog/elastalert-kibana-plugin-centralized-logging-with-integrated-alerting)
+
 ## Documentation
 
 Read the documentation at [Read the Docs](http://elastalert.readthedocs.org).
+
+To build a html version of the docs locally
+
+```
+pip install sphinx_rtd_theme sphinx
+cd docs
+make html
+```
+
+View in browser at build/html/index.html
 
 ## Configuration
 

@@ -12,12 +12,16 @@ from elastalert.alerts import Alerter
 from elastalert.alerts import BasicMatchString
 from elastalert.alerts import CommandAlerter
 from elastalert.alerts import EmailAlerter
+from elastalert.alerts import HTTPPostAlerter
 from elastalert.alerts import JiraAlerter
 from elastalert.alerts import JiraFormattedMatchString
+from elastalert.alerts import MsTeamsAlerter
+from elastalert.alerts import PagerDutyAlerter
 from elastalert.alerts import SlackAlerter
 from elastalert.config import load_modules
 from elastalert.opsgenie import OpsGenieAlerter
 from elastalert.util import ts_add
+from elastalert.util import ts_now
 
 
 class mock_rule:
@@ -108,6 +112,46 @@ def test_email():
         assert 'To: testing@test.test' in body
         assert 'From: testfrom@test.test' in body
         assert 'Subject: Test alert for test_value, owned by owner_value' in body
+
+
+def test_email_from_field():
+    rule = {'name': 'test alert', 'email': ['testing@test.test'], 'email_add_domain': 'example.com',
+            'type': mock_rule(), 'timestamp_field': '@timestamp', 'email_from_field': 'data.user', 'owner': 'owner_value'}
+    # Found, without @
+    with mock.patch('elastalert.alerts.SMTP') as mock_smtp:
+        mock_smtp.return_value = mock.Mock()
+        alert = EmailAlerter(rule)
+        alert.alert([{'data': {'user': 'qlo'}}])
+        assert mock_smtp.mock_calls[4][1][1] == ['qlo@example.com']
+
+    # Found, with @
+    rule['email_add_domain'] = '@example.com'
+    with mock.patch('elastalert.alerts.SMTP') as mock_smtp:
+        mock_smtp.return_value = mock.Mock()
+        alert = EmailAlerter(rule)
+        alert.alert([{'data': {'user': 'qlo'}}])
+        assert mock_smtp.mock_calls[4][1][1] == ['qlo@example.com']
+
+    # Found, list
+    with mock.patch('elastalert.alerts.SMTP') as mock_smtp:
+        mock_smtp.return_value = mock.Mock()
+        alert = EmailAlerter(rule)
+        alert.alert([{'data': {'user': ['qlo', 'foo']}}])
+        assert mock_smtp.mock_calls[4][1][1] == ['qlo@example.com', 'foo@example.com']
+
+    # Not found
+    with mock.patch('elastalert.alerts.SMTP') as mock_smtp:
+        mock_smtp.return_value = mock.Mock()
+        alert = EmailAlerter(rule)
+        alert.alert([{'data': {'foo': 'qlo'}}])
+        assert mock_smtp.mock_calls[4][1][1] == ['testing@test.test']
+
+    # Found, wrong type
+    with mock.patch('elastalert.alerts.SMTP') as mock_smtp:
+        mock_smtp.return_value = mock.Mock()
+        alert = EmailAlerter(rule)
+        alert.alert([{'data': {'user': 17}}])
+        assert mock_smtp.mock_calls[4][1][1] == ['testing@test.test']
 
 
 def test_email_with_unicode_strings():
@@ -219,10 +263,18 @@ def test_email_with_cc_and_bcc():
                     mock.call().ehlo(),
                     mock.call().has_extn('STARTTLS'),
                     mock.call().starttls(),
-                    mock.call().sendmail(mock.ANY,
-                                         ['testing@test.test', 'test@test.test', 'test1@test.com', 'test2@test.com', 'tester@testing.testing'],
-                                         mock.ANY),
-                    mock.call().close()]
+                    mock.call().sendmail(
+                        mock.ANY,
+                        [
+                            'testing@test.test',
+                            'test@test.test',
+                            'test1@test.com',
+                            'test2@test.com',
+                            'tester@testing.testing'
+                        ],
+                        mock.ANY
+        ),
+            mock.call().close()]
         assert mock_smtp.mock_calls == expected
 
         body = mock_smtp.mock_calls[4][1][2]
@@ -234,10 +286,18 @@ def test_email_with_cc_and_bcc():
 
 
 def test_email_with_args():
-    rule = {'name': 'test alert', 'email': ['testing@test.test', 'test@test.test'], 'from_addr': 'testfrom@test.test',
-            'type': mock_rule(), 'timestamp_field': '@timestamp', 'email_reply_to': 'test@example.com',
-            'alert_subject': 'Test alert for {0} {1}', 'alert_subject_args': ['test_term', 'test.term'], 'alert_text': 'Test alert for {0} and {1} {2}',
-            'alert_text_args': ['test_arg1', 'test_arg2', 'test.arg3']}
+    rule = {
+        'name': 'test alert',
+        'email': ['testing@test.test', 'test@test.test'],
+        'from_addr': 'testfrom@test.test',
+        'type': mock_rule(),
+        'timestamp_field': '@timestamp',
+        'email_reply_to': 'test@example.com',
+        'alert_subject': 'Test alert for {0} {1}',
+        'alert_subject_args': ['test_term', 'test.term'],
+        'alert_text': 'Test alert for {0} and {1} {2}',
+        'alert_text_args': ['test_arg1', 'test_arg2', 'test.arg3']
+    }
     with mock.patch('elastalert.alerts.SMTP') as mock_smtp:
         mock_smtp.return_value = mock.Mock()
 
@@ -436,6 +496,45 @@ def test_jira():
 
     assert mock_jira.mock_calls == expected
 
+    # Only bump after 3d of inactivity
+    rule['jira_bump_after_inactivity'] = 3
+    mock_issue = mock.Mock()
+
+    # Check ticket is bumped if it is updated 4 days ago
+    mock_issue.fields.updated = str(ts_now() - datetime.timedelta(days=4))
+    with nested(
+        mock.patch('elastalert.alerts.JIRA'),
+        mock.patch('elastalert.alerts.yaml_loader')
+    ) as (mock_jira, mock_open):
+        mock_open.return_value = {'user': 'jirauser', 'password': 'jirapassword'}
+        mock_jira.return_value = mock.Mock()
+        mock_jira.return_value.search_issues.return_value = [mock_issue]
+        mock_jira.return_value.priorities.return_value = [mock_priority]
+        mock_jira.return_value.fields.return_value = []
+
+        alert = JiraAlerter(rule)
+        alert.alert([{'test_term': 'test_value', '@timestamp': '2014-10-31T00:00:00'}])
+        # Check add_comment is called
+        assert len(mock_jira.mock_calls) == 5
+        assert '().add_comment' == mock_jira.mock_calls[4][0]
+
+    # Check ticket is bumped is not bumped if ticket is updated right now
+    mock_issue.fields.updated = str(ts_now())
+    with nested(
+        mock.patch('elastalert.alerts.JIRA'),
+        mock.patch('elastalert.alerts.yaml_loader')
+    ) as (mock_jira, mock_open):
+        mock_open.return_value = {'user': 'jirauser', 'password': 'jirapassword'}
+        mock_jira.return_value = mock.Mock()
+        mock_jira.return_value.search_issues.return_value = [mock_issue]
+        mock_jira.return_value.priorities.return_value = [mock_priority]
+        mock_jira.return_value.fields.return_value = []
+
+        alert = JiraAlerter(rule)
+        alert.alert([{'test_term': 'test_value', '@timestamp': '2014-10-31T00:00:00'}])
+        # Only 4 calls for mock_jira since add_comment is not called
+        assert len(mock_jira.mock_calls) == 4
+
 
 def test_jira_arbitrary_field_support():
     description_txt = "Description stuff goes here like a runbook link."
@@ -472,13 +571,29 @@ def test_jira_arbitrary_field_support():
         {'name': 'arbitrary reference string field', 'id': 'arbitrary_reference_string_field', 'schema': {'type': 'string'}},
         {'name': 'arbitrary string field', 'id': 'arbitrary_string_field', 'schema': {'type': 'string'}},
         {'name': 'arbitrary string array field', 'id': 'arbitrary_string_array_field', 'schema': {'type': 'array', 'items': 'string'}},
-        {'name': 'arbitrary string array field provided as single value', 'id': 'arbitrary_string_array_field_provided_as_single_value', 'schema': {'type': 'array', 'items': 'string'}},
+        {
+            'name': 'arbitrary string array field provided as single value',
+            'id': 'arbitrary_string_array_field_provided_as_single_value',
+            'schema': {'type': 'array', 'items': 'string'}
+        },
         {'name': 'arbitrary number field', 'id': 'arbitrary_number_field', 'schema': {'type': 'number'}},
         {'name': 'arbitrary number array field', 'id': 'arbitrary_number_array_field', 'schema': {'type': 'array', 'items': 'number'}},
-        {'name': 'arbitrary number array field provided as single value', 'id': 'arbitrary_number_array_field_provided_as_single_value', 'schema': {'type': 'array', 'items': 'number'}},
+        {
+            'name': 'arbitrary number array field provided as single value',
+            'id': 'arbitrary_number_array_field_provided_as_single_value',
+            'schema': {'type': 'array', 'items': 'number'}
+        },
         {'name': 'arbitrary complex field', 'id': 'arbitrary_complex_field', 'schema': {'type': 'ArbitraryType'}},
-        {'name': 'arbitrary complex array field', 'id': 'arbitrary_complex_array_field', 'schema': {'type': 'array', 'items': 'ArbitraryType'}},
-        {'name': 'arbitrary complex array field provided as single value', 'id': 'arbitrary_complex_array_field_provided_as_single_value', 'schema': {'type': 'array', 'items': 'ArbitraryType'}},
+        {
+            'name': 'arbitrary complex array field',
+            'id': 'arbitrary_complex_array_field',
+            'schema': {'type': 'array', 'items': 'ArbitraryType'}
+        },
+        {
+            'name': 'arbitrary complex array field provided as single value',
+            'id': 'arbitrary_complex_array_field_provided_as_single_value',
+            'schema': {'type': 'array', 'items': 'ArbitraryType'}
+        },
     ]
 
     with nested(
@@ -572,7 +687,9 @@ def test_kibana(ea):
     with mock.patch("elastalert.elastalert.elasticsearch_client") as mock_es:
         mock_create = mock.Mock(return_value={'_id': 'ABCDEFGH'})
         mock_es_inst = mock.Mock()
-        mock_es_inst.create = mock_create
+        mock_es_inst.index = mock_create
+        mock_es_inst.host = 'test.testing'
+        mock_es_inst.port = 12345
         mock_es.return_value = mock_es_inst
         link = ea.generate_kibana_db(rule, match)
 
@@ -600,24 +717,51 @@ def test_command():
     rule = {'command': ['/bin/test/', '--arg', '%(somefield)s']}
     alert = CommandAlerter(rule)
     match = {'@timestamp': '2014-01-01T00:00:00',
-             'somefield': 'foobarbaz'}
+             'somefield': 'foobarbaz',
+             'nested': {'field': 1}}
     with mock.patch("elastalert.alerts.subprocess.Popen") as mock_popen:
         alert.alert([match])
     assert mock_popen.called_with(['/bin/test', '--arg', 'foobarbaz'], stdin=subprocess.PIPE, shell=False)
 
-    # Test command as string with formatted arg
+    # Test command as string with formatted arg (old-style string format)
     rule = {'command': '/bin/test/ --arg %(somefield)s'}
     alert = CommandAlerter(rule)
     with mock.patch("elastalert.alerts.subprocess.Popen") as mock_popen:
         alert.alert([match])
     assert mock_popen.called_with('/bin/test --arg foobarbaz', stdin=subprocess.PIPE, shell=False)
 
-    # Test command as string without formatted arg
+    # Test command as string without formatted arg (old-style string format)
     rule = {'command': '/bin/test/foo.sh'}
     alert = CommandAlerter(rule)
     with mock.patch("elastalert.alerts.subprocess.Popen") as mock_popen:
         alert.alert([match])
     assert mock_popen.called_with('/bin/test/foo.sh', stdin=subprocess.PIPE, shell=True)
+
+    # Test command as string with formatted arg (new-style string format)
+    rule = {'command': '/bin/test/ --arg {match[somefield]}', 'new_style_string_format': True}
+    alert = CommandAlerter(rule)
+    with mock.patch("elastalert.alerts.subprocess.Popen") as mock_popen:
+        alert.alert([match])
+    assert mock_popen.called_with('/bin/test --arg foobarbaz', stdin=subprocess.PIPE, shell=False)
+
+    rule = {'command': '/bin/test/ --arg {match[nested][field]}', 'new_style_string_format': True}
+    alert = CommandAlerter(rule)
+    with mock.patch("elastalert.alerts.subprocess.Popen") as mock_popen:
+        alert.alert([match])
+    assert mock_popen.called_with('/bin/test --arg 1', stdin=subprocess.PIPE, shell=False)
+
+    # Test command as string without formatted arg (new-style string format)
+    rule = {'command': '/bin/test/foo.sh', 'new_style_string_format': True}
+    alert = CommandAlerter(rule)
+    with mock.patch("elastalert.alerts.subprocess.Popen") as mock_popen:
+        alert.alert([match])
+    assert mock_popen.called_with('/bin/test/foo.sh', stdin=subprocess.PIPE, shell=True)
+
+    rule = {'command': '/bin/test/foo.sh {{bar}}', 'new_style_string_format': True}
+    alert = CommandAlerter(rule)
+    with mock.patch("elastalert.alerts.subprocess.Popen") as mock_popen:
+        alert.alert([match])
+    assert mock_popen.called_with('/bin/test/foo.sh {bar}', stdin=subprocess.PIPE, shell=True)
 
     # Test command with pipe_match_json
     rule = {'command': ['/bin/test/', '--arg', '%(somefield)s'],
@@ -649,6 +793,79 @@ def test_command():
     assert "Non-zero exit code while running command" in str(exception)
 
 
+def test_ms_teams():
+    rule = {
+        'name': 'Test Rule',
+        'type': 'any',
+        'ms_teams_webhook_url': 'http://test.webhook.url',
+        'ms_teams_alert_summary': 'Alert from ElastAlert',
+        'alert_subject': 'Cool subject',
+        'alert': []
+    }
+    load_modules(rule)
+    alert = MsTeamsAlerter(rule)
+    match = {
+        '@timestamp': '2016-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+
+    expected_data = {
+        '@type': 'MessageCard',
+        '@context': 'http://schema.org/extensions',
+        'summary': rule['ms_teams_alert_summary'],
+        'title': rule['alert_subject'],
+        'text': BasicMatchString(rule, match).__str__()
+    }
+    mock_post_request.assert_called_once_with(
+        rule['ms_teams_webhook_url'],
+        data=mock.ANY,
+        headers={'content-type': 'application/json'},
+        proxies=None
+    )
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
+def test_ms_teams_uses_color_and_fixed_width_text():
+    rule = {
+        'name': 'Test Rule',
+        'type': 'any',
+        'ms_teams_webhook_url': 'http://test.webhook.url',
+        'ms_teams_alert_summary': 'Alert from ElastAlert',
+        'ms_teams_alert_fixed_width': True,
+        'ms_teams_theme_color': '#124578',
+        'alert_subject': 'Cool subject',
+        'alert': []
+    }
+    load_modules(rule)
+    alert = MsTeamsAlerter(rule)
+    match = {
+        '@timestamp': '2016-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+    body = BasicMatchString(rule, match).__str__()
+    body = body.replace('`', "'")
+    body = "```{0}```".format('```\n\n```'.join(x for x in body.split('\n'))).replace('\n``````', '')
+    expected_data = {
+        '@type': 'MessageCard',
+        '@context': 'http://schema.org/extensions',
+        'summary': rule['ms_teams_alert_summary'],
+        'title': rule['alert_subject'],
+        'themeColor': '#124578',
+        'text': body
+    }
+    mock_post_request.assert_called_once_with(
+        rule['ms_teams_webhook_url'],
+        data=mock.ANY,
+        headers={'content-type': 'application/json'},
+        proxies=None
+    )
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
 def test_slack_uses_custom_title():
     rule = {
         'name': 'Test Rule',
@@ -675,13 +892,19 @@ def test_slack_uses_custom_title():
                 'color': 'danger',
                 'title': rule['alert_subject'],
                 'text': BasicMatchString(rule, match).__str__(),
+                'mrkdwn_in': ['text', 'pretext'],
                 'fields': []
             }
         ],
         'text': '',
         'parse': 'none'
     }
-    mock_post_request.assert_called_once_with(rule['slack_webhook_url'], data=mock.ANY, headers={'content-type': 'application/json'}, proxies=None)
+    mock_post_request.assert_called_once_with(
+        rule['slack_webhook_url'],
+        data=mock.ANY,
+        headers={'content-type': 'application/json'},
+        proxies=None
+    )
     assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
 
 
@@ -710,13 +933,19 @@ def test_slack_uses_rule_name_when_custom_title_is_not_provided():
                 'color': 'danger',
                 'title': rule['name'],
                 'text': BasicMatchString(rule, match).__str__(),
+                'mrkdwn_in': ['text', 'pretext'],
                 'fields': []
             }
         ],
         'text': '',
         'parse': 'none'
     }
-    mock_post_request.assert_called_once_with(rule['slack_webhook_url'][0], data=mock.ANY, headers={'content-type': 'application/json'}, proxies=None)
+    mock_post_request.assert_called_once_with(
+        rule['slack_webhook_url'][0],
+        data=mock.ANY,
+        headers={'content-type': 'application/json'},
+        proxies=None
+    )
     assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
 
 
@@ -746,13 +975,273 @@ def test_slack_uses_custom_slack_channel():
                 'color': 'danger',
                 'title': rule['name'],
                 'text': BasicMatchString(rule, match).__str__(),
+                'mrkdwn_in': ['text', 'pretext'],
                 'fields': []
             }
         ],
         'text': '',
         'parse': 'none'
     }
-    mock_post_request.assert_called_once_with(rule['slack_webhook_url'][0], data=mock.ANY, headers={'content-type': 'application/json'}, proxies=None)
+    mock_post_request.assert_called_once_with(
+        rule['slack_webhook_url'][0],
+        data=mock.ANY,
+        headers={'content-type': 'application/json'},
+        proxies=None
+    )
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
+def test_http_alerter_with_payload():
+    rule = {
+        'name': 'Test HTTP Post Alerter With Payload',
+        'type': 'any',
+        'http_post_url': 'http://test.webhook.url',
+        'http_post_payload': {'posted_name': 'somefield'},
+        'http_post_static_payload': {'name': 'somestaticname'},
+        'alert': []
+    }
+    load_modules(rule)
+    alert = HTTPPostAlerter(rule)
+    match = {
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+    expected_data = {
+        'posted_name': 'foobarbaz',
+        'name': 'somestaticname'
+    }
+    mock_post_request.assert_called_once_with(
+        rule['http_post_url'],
+        data=mock.ANY,
+        headers={'Content-Type': 'application/json', 'Accept': 'application/json;charset=utf-8'},
+        proxies=None
+    )
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
+def test_http_alerter_with_payload_all_values():
+    rule = {
+        'name': 'Test HTTP Post Alerter With Payload',
+        'type': 'any',
+        'http_post_url': 'http://test.webhook.url',
+        'http_post_payload': {'posted_name': 'somefield'},
+        'http_post_static_payload': {'name': 'somestaticname'},
+        'http_post_all_values': True,
+        'alert': []
+    }
+    load_modules(rule)
+    alert = HTTPPostAlerter(rule)
+    match = {
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+    expected_data = {
+        'posted_name': 'foobarbaz',
+        'name': 'somestaticname',
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    mock_post_request.assert_called_once_with(
+        rule['http_post_url'],
+        data=mock.ANY,
+        headers={'Content-Type': 'application/json', 'Accept': 'application/json;charset=utf-8'},
+        proxies=None
+    )
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
+def test_http_alerter_without_payload():
+    rule = {
+        'name': 'Test HTTP Post Alerter Without Payload',
+        'type': 'any',
+        'http_post_url': 'http://test.webhook.url',
+        'http_post_static_payload': {'name': 'somestaticname'},
+        'alert': []
+    }
+    load_modules(rule)
+    alert = HTTPPostAlerter(rule)
+    match = {
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+    expected_data = {
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'foobarbaz',
+        'name': 'somestaticname'
+    }
+    mock_post_request.assert_called_once_with(
+        rule['http_post_url'],
+        data=mock.ANY,
+        headers={'Content-Type': 'application/json', 'Accept': 'application/json;charset=utf-8'},
+        proxies=None
+    )
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
+def test_pagerduty_alerter():
+    rule = {
+        'name': 'Test PD Rule',
+        'type': 'any',
+        'pagerduty_service_key': 'magicalbadgers',
+        'pagerduty_client_name': 'ponies inc.',
+        'alert': []
+    }
+    load_modules(rule)
+    alert = PagerDutyAlerter(rule)
+    match = {
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+    expected_data = {
+        'client': 'ponies inc.',
+        'description': 'Test PD Rule',
+        'details': {
+            'information': 'Test PD Rule\n\n@timestamp: 2017-01-01T00:00:00\nsomefield: foobarbaz\n'
+        },
+        'event_type': 'trigger',
+        'incident_key': '',
+        'service_key': 'magicalbadgers',
+    }
+    mock_post_request.assert_called_once_with(alert.url, data=mock.ANY, headers={'content-type': 'application/json'}, proxies=None)
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
+def test_pagerduty_alerter_custom_incident_key():
+    rule = {
+        'name': 'Test PD Rule',
+        'type': 'any',
+        'pagerduty_service_key': 'magicalbadgers',
+        'pagerduty_client_name': 'ponies inc.',
+        'pagerduty_incident_key': 'custom key',
+        'alert': []
+    }
+    load_modules(rule)
+    alert = PagerDutyAlerter(rule)
+    match = {
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+    expected_data = {
+        'client': 'ponies inc.',
+        'description': 'Test PD Rule',
+        'details': {
+            'information': 'Test PD Rule\n\n@timestamp: 2017-01-01T00:00:00\nsomefield: foobarbaz\n'
+        },
+        'event_type': 'trigger',
+        'incident_key': 'custom key',
+        'service_key': 'magicalbadgers',
+    }
+    mock_post_request.assert_called_once_with(alert.url, data=mock.ANY, headers={'content-type': 'application/json'}, proxies=None)
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
+def test_pagerduty_alerter_custom_incident_key_with_args():
+    rule = {
+        'name': 'Test PD Rule',
+        'type': 'any',
+        'pagerduty_service_key': 'magicalbadgers',
+        'pagerduty_client_name': 'ponies inc.',
+        'pagerduty_incident_key': 'custom {0}',
+        'pagerduty_incident_key_args': ['somefield'],
+        'alert': []
+    }
+    load_modules(rule)
+    alert = PagerDutyAlerter(rule)
+    match = {
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+    expected_data = {
+        'client': 'ponies inc.',
+        'description': 'Test PD Rule',
+        'details': {
+            'information': 'Test PD Rule\n\n@timestamp: 2017-01-01T00:00:00\nsomefield: foobarbaz\n'
+        },
+        'event_type': 'trigger',
+        'incident_key': 'custom foobarbaz',
+        'service_key': 'magicalbadgers',
+    }
+    mock_post_request.assert_called_once_with(alert.url, data=mock.ANY, headers={'content-type': 'application/json'}, proxies=None)
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
+def test_pagerduty_alerter_custom_alert_subject():
+    rule = {
+        'name': 'Test PD Rule',
+        'type': 'any',
+        'alert_subject': 'Hungry kittens',
+        'pagerduty_service_key': 'magicalbadgers',
+        'pagerduty_client_name': 'ponies inc.',
+        'pagerduty_incident_key': 'custom {0}',
+        'pagerduty_incident_key_args': ['somefield'],
+        'alert': []
+    }
+    load_modules(rule)
+    alert = PagerDutyAlerter(rule)
+    match = {
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+    expected_data = {
+        'client': 'ponies inc.',
+        'description': 'Hungry kittens',
+        'details': {
+            'information': 'Test PD Rule\n\n@timestamp: 2017-01-01T00:00:00\nsomefield: foobarbaz\n'
+        },
+        'event_type': 'trigger',
+        'incident_key': 'custom foobarbaz',
+        'service_key': 'magicalbadgers',
+    }
+    mock_post_request.assert_called_once_with(alert.url, data=mock.ANY, headers={'content-type': 'application/json'}, proxies=None)
+    assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
+
+
+def test_pagerduty_alerter_custom_alert_subject_with_args():
+    rule = {
+        'name': 'Test PD Rule',
+        'type': 'any',
+        'alert_subject': '{0} kittens',
+        'alert_subject_args': ['somefield'],
+        'pagerduty_service_key': 'magicalbadgers',
+        'pagerduty_client_name': 'ponies inc.',
+        'pagerduty_incident_key': 'custom {0}',
+        'pagerduty_incident_key_args': ['someotherfield'],
+        'alert': []
+    }
+    load_modules(rule)
+    alert = PagerDutyAlerter(rule)
+    match = {
+        '@timestamp': '2017-01-01T00:00:00',
+        'somefield': 'Stinky',
+        'someotherfield': 'foobarbaz'
+    }
+    with mock.patch('requests.post') as mock_post_request:
+        alert.alert([match])
+    expected_data = {
+        'client': 'ponies inc.',
+        'description': 'Stinky kittens',
+        'details': {
+            'information': 'Test PD Rule\n\n@timestamp: 2017-01-01T00:00:00\nsomefield: Stinky\nsomeotherfield: foobarbaz\n'
+        },
+        'event_type': 'trigger',
+        'incident_key': 'custom foobarbaz',
+        'service_key': 'magicalbadgers',
+    }
+    mock_post_request.assert_called_once_with(alert.url, data=mock.ANY, headers={'content-type': 'application/json'}, proxies=None)
     assert expected_data == json.loads(mock_post_request.call_args_list[0][1]['data'])
 
 
